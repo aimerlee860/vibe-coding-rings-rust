@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleName</key>
+    <string>Vibe Coding Rings</string>
+    <key>CFBundleDisplayName</key>
+    <string>Vibe Coding Rings</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.zxw1992.vibe-coding-rings</string>
+    <key>CFBundleVersion</key>
+    <string>1.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT</string>
+    <key>CFBundleExecutable</key>
+    <string>vibe-coding-rings</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+</dict>
+</plist>

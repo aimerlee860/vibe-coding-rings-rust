@@ -241,14 +241,6 @@ pub trait AgentProvider: Send + Sync {
     fn is_available(&self) -> bool;
     /// Collect all data in one pass (more efficient than separate calls)
     fn collect_all(&self, target: chrono::NaiveDate) -> DayData;
-
-    // Legacy methods - kept for interface compatibility but not used internally
-    #[allow(dead_code)]
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64);
-    #[allow(dead_code)]
-    fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64;
-    #[allow(dead_code)]
-    fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData;
 }
 
 /// Combined data for a single day - collected in one file traversal
@@ -359,22 +351,6 @@ impl AgentProvider for ClaudeCodeProvider {
         data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
 
         data
-    }
-
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
-        let data = self.collect_all(target);
-        (data.tokens, data.tools)
-    }
-
-    fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let history_file = config::claude_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, true);
-        focus_from_sessions(&sessions, start_ms, end_ms)
-    }
-
-    fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        self.collect_all(target).hourly
     }
 }
 
@@ -501,22 +477,6 @@ impl AgentProvider for CodexProvider {
         data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
 
         data
-    }
-
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
-        let data = self.collect_all(target);
-        (data.tokens, data.tools)
-    }
-
-    fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let history_file = config::codex_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        focus_from_sessions(&sessions, start_ms, end_ms)
-    }
-
-    fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        self.collect_all(target).hourly
     }
 }
 
@@ -646,30 +606,6 @@ impl AgentProvider for GeminiProvider {
 
         data
     }
-
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
-        let data = self.collect_all(target);
-        (data.tokens, data.tools)
-    }
-
-    fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        for name in &["history.jsonl", "history"] {
-            let history = config::gemini_dir().join(name);
-            if history.exists() {
-                let sessions = read_history_sessions(&history, start_ms, end_ms, false);
-                let result = focus_from_sessions(&sessions, start_ms, end_ms);
-                if result > 0.0 {
-                    return result;
-                }
-            }
-        }
-        0.0
-    }
-
-    fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        self.collect_all(target).hourly
-    }
 }
 
 // ── OpenCode provider ─────────────────────────────────────────────────────────
@@ -739,21 +675,5 @@ impl AgentProvider for OpenCodeProvider {
         data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
 
         data
-    }
-
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
-        let data = self.collect_all(target);
-        (data.tokens, data.tools)
-    }
-
-    fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let history_file = config::opencode_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        focus_from_sessions(&sessions, start_ms, end_ms)
-    }
-
-    fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        self.collect_all(target).hourly
     }
 }

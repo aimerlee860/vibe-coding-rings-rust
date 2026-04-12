@@ -1,14 +1,14 @@
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::{define_class, msg_send, msg_send_id, ClassType};
-use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSMenu, NSView};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{define_class, msg_send, msg_send_id, ClassType, MainThreadOnly};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSView};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
 
 use crate::config::load_config;
-use crate::data_collector::{calc_streak_fast, collect_day_metrics, clear_all_cache};
+use crate::data_collector::{calc_streak_fast, collect_day_metrics};
 use crate::server::PORT;
 
 // ── Ring definitions (radius, r, g, b) — matches style.css ───────────────────
@@ -158,7 +158,6 @@ struct MenuBarUI {
     item_focus: Retained<AnyObject>,
     item_tools: Retained<AnyObject>,
     item_streak: Retained<AnyObject>,
-    item_refresh: Retained<AnyObject>,
     item_open: Retained<AnyObject>,
 }
 
@@ -172,6 +171,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[name = "VibeMenuTarget"]
     #[ivars = ()]
+    #[thread_kind = MainThreadOnly]
     pub struct MenuActionTarget;
 
     impl MenuActionTarget {
@@ -208,12 +208,6 @@ define_class!(
             std::process::exit(0);
         }
 
-        #[unsafe(method(refreshNow:))]
-        unsafe fn refresh_now(&self, _sender: Option<&AnyObject>) {
-            clear_all_cache();
-            refresh_stats();
-        }
-
         // NSMenuDelegate method - called when menu is about to open
         #[unsafe(method(menuWillOpen:))]
         unsafe fn menu_will_open(&self, _menu: Option<&NSMenu>) {
@@ -221,6 +215,10 @@ define_class!(
         }
     }
 );
+
+// Implement required protocols
+unsafe impl NSObjectProtocol for MenuActionTarget {}
+unsafe impl NSMenuDelegate for MenuActionTarget {}
 
 // ── Refresh stats (called on main thread) ─────────────────────────────────────
 
@@ -252,13 +250,12 @@ fn refresh_stats() {
         let foc_str = format!("{}", metrics.focus_min.round() as u64);
         let tol_str = metrics.tool_calls.to_string();
 
-        let (tokens_title, focus_title, tools_title, streak_title, refresh_title, open_title) = if zh {
+        let (tokens_title, focus_title, tools_title, streak_title, open_title) = if zh {
             (
                 format!("消耗   {tok_str} / {tok_goal}  ({})", fmt_pct(tp)),
                 format!("专注   {foc_str} / {} 分钟  ({})", goals.focus_min, fmt_pct(fp)),
                 format!("行动   {tol_str} / {} 次  ({})", goals.tool_calls, fmt_pct(ap)),
                 format!("🔥  连续达标 {streak} 天"),
-                "立即刷新".to_string(),
                 "打开看板 ↗".to_string(),
             )
         } else {
@@ -267,7 +264,6 @@ fn refresh_stats() {
                 format!("Focus   {foc_str} / {} min  ({})", goals.focus_min, fmt_pct(fp)),
                 format!("Action   {tol_str} / {} calls  ({})", goals.tool_calls, fmt_pct(ap)),
                 format!("🔥  {streak}-day streak"),
-                "Refresh Now".to_string(),
                 "Open Dashboard ↗".to_string(),
             )
         };
@@ -277,7 +273,6 @@ fn refresh_stats() {
             let _: () = msg_send![&*ui.item_focus, setTitle: &*NSString::from_str(&focus_title)];
             let _: () = msg_send![&*ui.item_tools, setTitle: &*NSString::from_str(&tools_title)];
             let _: () = msg_send![&*ui.item_streak, setTitle: &*NSString::from_str(&streak_title)];
-            let _: () = msg_send![&*ui.item_refresh, setTitle: &*NSString::from_str(&refresh_title)];
             let _: () = msg_send![&*ui.item_open, setTitle: &*NSString::from_str(&open_title)];
         }
     });
@@ -330,7 +325,7 @@ pub fn run_menubar() {
         let _: () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Accessory];
 
         // Create delegate — use T::class() to ensure class registration
-        let delegate: Retained<AnyObject> = msg_send_id![MenuActionTarget::class(), new];
+        let delegate: Retained<MenuActionTarget> = msg_send_id![MenuActionTarget::class(), new];
 
         // Status bar
         let status_bar: Retained<AnyObject> = msg_send_id![objc2::class!(NSStatusBar), systemStatusBar];
@@ -400,13 +395,6 @@ pub fn run_menubar() {
         let sep4: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
         let _: () = msg_send![&menu, addItem: &*sep4];
 
-        // Refresh now
-        let item_refresh: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
-        let _: () = msg_send![&item_refresh, setTitle: &*NSString::from_str("Refresh Now")];
-        let _: () = msg_send![&item_refresh, setTarget: &*delegate];
-        let _: () = msg_send![&item_refresh, setAction: objc2::sel!(refreshNow:)];
-        let _: () = msg_send![&menu, addItem: &*item_refresh];
-
         // Open dashboard
         let item_open: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_open, setTitle: &*NSString::from_str("Open Dashboard ↗")];
@@ -429,7 +417,8 @@ pub fn run_menubar() {
         let _: () = msg_send![&status_item, setMenu: &*menu];
 
         // Set menu delegate to receive menuWillOpen events
-        let _: () = msg_send![&menu, setDelegate: &*delegate];
+        let delegate_proto: Retained<ProtocolObject<dyn NSMenuDelegate>> = ProtocolObject::from_retained(delegate.clone());
+        let _: () = msg_send![&menu, setDelegate: Some(&*delegate_proto)];
 
         // Keep references alive
         let ui = Rc::new(MenuBarUI {
@@ -438,7 +427,6 @@ pub fn run_menubar() {
             item_focus,
             item_tools,
             item_streak,
-            item_refresh,
             item_open,
         });
 

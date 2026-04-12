@@ -1,7 +1,4 @@
 use chrono::{Duration, Local, NaiveDate};
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Goals, StreakCache};
 use crate::providers::{
@@ -65,40 +62,10 @@ impl DayMetrics {
     }
 }
 
-// ── Cache (includes hourly data for efficiency) ────────────────────────────────
-
-/// Cached day data - includes both metrics and hourly breakdown
-struct CachedDayData {
-    timestamp: u64,
-    metrics: DayMetrics,
-    hourly: HourlyData,
-}
-
-const CACHE_EXPIRY_SECS: u64 = 3600; // 1 hour
-
-static CACHE: LazyLock<Mutex<HashMap<String, CachedDayData>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn cache_key(target: &NaiveDate, goals: &Goals) -> String {
-    format!(
-        "{}_{}_{}_{}",
-        target, goals.tokens, goals.focus_min, goals.enabled_agents.join(",")
-    )
-}
-
-/// Remove expired entries from cache
-fn cleanup_cache(cache: &mut HashMap<String, CachedDayData>) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    cache.retain(|_, v| now - v.timestamp < CACHE_EXPIRY_SECS);
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Collect all data for a day in one pass - returns both metrics and hourly
-fn collect_day_data(target: NaiveDate, goals: &Goals) -> CachedDayData {
+/// Collect all data for a day in one pass - returns both metrics and hourly breakdown
+fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData) {
     let provs = active_providers(goals);
     let mut total_tokens: u64 = 0;
     let mut total_tools: u64 = 0;
@@ -111,7 +78,7 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> CachedDayData {
         let data = p.collect_all(target);
         total_tokens += data.tokens;
         total_tools += data.tools;
-        total_focus += data.focus_min;  // Use focus from collect_all, avoid duplicate read
+        total_focus += data.focus_min;
         for h in 0..24 {
             hourly_tokens[h] += data.hourly.tokens[h];
             hourly_tools[h] += data.hourly.tools[h];
@@ -135,46 +102,17 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> CachedDayData {
         focus: hourly_focus,
     };
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    CachedDayData { timestamp, metrics, hourly }
+    (metrics, hourly)
 }
 
+/// Collect day metrics - no caching, always fresh data
 pub fn collect_day_metrics(target: NaiveDate, goals: &Goals) -> DayMetrics {
-    let key = cache_key(&target, goals);
-    {
-        let cache = CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(&key) {
-            return cached.metrics.clone();
-        }
-    }
-
-    let data = collect_day_data(target, goals);
-    let metrics = data.metrics.clone();
-    {
-        let mut cache = CACHE.lock().unwrap();
-        cleanup_cache(&mut cache);  // Remove expired entries
-        cache.insert(key, data);
-    }
-    metrics
+    collect_day_data(target, goals).0
 }
 
-#[allow(dead_code)]
-pub fn collect_day_metrics_force(target: NaiveDate, goals: &Goals) -> DayMetrics {
-    let key = cache_key(&target, goals);
-    {
-        let mut cache = CACHE.lock().unwrap();
-        cache.remove(&key);
-    }
-    collect_day_metrics(target, goals)
-}
-
-pub fn clear_all_cache() {
-    let mut cache = CACHE.lock().unwrap();
-    cache.clear();
+/// Collect both metrics and hourly data in one pass - avoids duplicate scanning
+pub fn collect_day_full(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData) {
+    collect_day_data(target, goals)
 }
 
 pub fn collect_history(goals: &Goals, days: usize) -> Vec<DayMetrics> {
@@ -279,24 +217,9 @@ pub fn calc_streak_fast(today_metrics: &DayMetrics, goals: &Goals) -> u32 {
     }
 }
 
-/// Collect hourly data - uses shared cache with collect_day_metrics
+/// Collect hourly data - no caching, always fresh data
 pub fn collect_hourly(target: NaiveDate, goals: &Goals) -> HourlyData {
-    let key = cache_key(&target, goals);
-    {
-        let cache = CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(&key) {
-            return cached.hourly.clone();
-        }
-    }
-
-    let data = collect_day_data(target, goals);
-    let hourly = data.hourly.clone();
-    {
-        let mut cache = CACHE.lock().unwrap();
-        cleanup_cache(&mut cache);  // Remove expired entries
-        cache.insert(key, data);
-    }
-    hourly
+    collect_day_data(target, goals).1
 }
 
 // ── Agent meta ────────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ use tower_http::services::ServeDir;
 
 use crate::config::{load_config, save_config};
 use crate::data_collector::{
-    agent_meta, calc_streak, collect_day_metrics, collect_history, collect_hourly, providers,
+    agent_meta, calc_streak, collect_day_full, collect_history, providers,
     update_streak_cache,
 };
 
@@ -75,12 +75,13 @@ pub fn build_router(static_dir: String, state: SharedState) -> Router {
 
 async fn api_today(State(_state): State<SharedState>) -> Json<serde_json::Value> {
     let mut goals = load_config();
-    let today = chrono::Local::now().date_naive();
-    let metrics = collect_day_metrics(today, &goals);
+    // 扫描7天数据（包含当天），避免重复扫描
     let history = collect_history(&goals, 7);
     let streak = calc_streak(&history);
     // 更新 streak 缓存，以便菜单栏下次刷新使用
     update_streak_cache(&history, &mut goals);
+    // 当天数据是 history[0]
+    let metrics = &history[0];
 
     Json(serde_json::json!({
         "metrics": {
@@ -235,8 +236,8 @@ async fn api_hourly(Query(query): Query<HourlyQuery>) -> Result<Json<serde_json:
         .unwrap_or_else(|| chrono::Local::now().date_naive());
 
     let goals = load_config();
-    let hourly = collect_hourly(target, &goals);
-    let day_metrics = collect_day_metrics(target, &goals);
+    // 一次扫描获取 metrics 和 hourly，避免重复
+    let (day_metrics, hourly) = collect_day_full(target, &goals);
 
     let (hourly_data, total, goal_val) = match metric {
         "tokens" => (&hourly.tokens, day_metrics.tokens, goals.tokens),

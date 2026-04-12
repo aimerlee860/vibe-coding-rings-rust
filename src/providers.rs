@@ -1,7 +1,8 @@
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -53,8 +54,9 @@ fn sessions_to_focus_blocks(sessions: &Sessions) -> Vec<(i64, i64)> {
         if ts_list.is_empty() {
             continue;
         }
-        let mut ts_sorted = ts_list.clone();
-        ts_sorted.sort();
+        // Avoid cloning - collect timestamps and sort in-place
+        let mut ts_sorted: Vec<i64> = ts_list.iter().copied().collect();
+        ts_sorted.sort_unstable();  // faster than sort() for integers
         let mut blk_start = ts_sorted[0];
         let mut blk_end = ts_sorted[0];
         for &ts in &ts_sorted[1..] {
@@ -107,7 +109,7 @@ pub fn focus_from_sessions(sessions: &Sessions, start_ms: i64, end_ms: i64) -> f
     interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0
 }
 
-pub fn focus_hourly_from_sessions(sessions: &Sessions, start_ms: i64, end_ms: i64) -> Vec<f64> {
+pub fn focus_hourly_from_sessions(sessions: &Sessions, start_ms: i64, _end_ms: i64) -> Vec<f64> {
     if sessions.is_empty() {
         return vec![0.0; 24];
     }
@@ -122,18 +124,35 @@ pub fn focus_hourly_from_sessions(sessions: &Sessions, start_ms: i64, end_ms: i6
         .collect()
 }
 
-// ── JSONL reading helpers ─────────────────────────────────────────────────────
+// ── JSONL reading helpers (streaming) ───────────────────────────────────────────
 
-pub fn read_jsonl(path: &Path) -> Vec<Value> {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+/// Process JSONL file line by line, calling callback for each parsed entry.
+/// More memory-efficient than reading entire file.
+pub fn process_jsonl<F>(path: &Path, mut callback: F)
+where
+    F: FnMut(&Value),
+{
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
     };
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    let reader = BufReader::new(file);
+    for line in reader.lines().filter_map(|l| l.ok()) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Value>(&line) {
+            callback(&entry);
+        }
+    }
+}
+
+/// Legacy function for backwards compatibility (uses streaming internally)
+#[allow(dead_code)]
+pub fn read_jsonl(path: &Path) -> Vec<Value> {
+    let mut entries = Vec::new();
+    process_jsonl(path, |entry| entries.push(entry.clone()));
+    entries
 }
 
 pub fn read_history_sessions(
@@ -146,18 +165,19 @@ pub fn read_history_sessions(
     if !history_file.exists() {
         return sessions;
     }
-    for entry in read_jsonl(history_file) {
+    // Use streaming instead of loading all entries
+    process_jsonl(history_file, |entry| {
         let ts = match entry.get("timestamp") {
             Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
-            _ => continue,
+            _ => return,
         };
         if !(start_ms..end_ms).contains(&ts) {
-            continue;
+            return;
         }
         if filter_slashcmds {
             if let Some(Value::String(display)) = entry.get("display") {
                 if display.trim().starts_with('/') {
-                    continue;
+                    return;
                 }
             }
         }
@@ -166,15 +186,27 @@ pub fn read_history_sessions(
             _ => "__nosid__".to_string(),
         };
         sessions.entry(sid).or_default().push(ts);
-    }
+    });
     sessions
 }
 
 // ── File iteration helper ─────────────────────────────────────────────────────
 
+/// Maximum age of files to consider (days). Files older than this are skipped entirely.
+const MAX_FILE_AGE_DAYS: f64 = 8.0; // 7 days + 1 day buffer for timezone
+
 pub fn iter_session_files(dir: &Path, start_ms: i64, end_ms: i64) -> Vec<PathBuf> {
-    let mtime_lo = (start_ms as f64 / 1000.0) - 2.0 * 86_400.0;
-    let mtime_hi = (end_ms as f64 / 1000.0) + 2.0 * 86_400.0;
+    // Global cutoff: ignore files older than MAX_FILE_AGE_DAYS from now
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as f64;
+    let global_mtime_lo = now_secs - MAX_FILE_AGE_DAYS * 86_400.0;
+
+    // Query-specific window: ±1 day for timezone safety
+    let query_mtime_lo = (start_ms as f64 / 1000.0) - 1.0 * 86_400.0;
+    let query_mtime_hi = (end_ms as f64 / 1000.0) + 1.0 * 86_400.0;
+
     let mut files = Vec::new();
     if !dir.exists() {
         return files;
@@ -182,13 +214,18 @@ pub fn iter_session_files(dir: &Path, start_ms: i64, end_ms: i64) -> Vec<PathBuf
     for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Ok(meta) = fs::metadata(path) {
+            if let Ok(meta) = std::fs::metadata(path) {
                 if let Ok(modified) = meta.modified() {
                     let mtime = modified
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as f64;
-                    if mtime_lo <= mtime && mtime <= mtime_hi {
+                    // Skip files older than global cutoff
+                    if mtime < global_mtime_lo {
+                        continue;
+                    }
+                    // Check query-specific window
+                    if query_mtime_lo <= mtime && mtime <= query_mtime_hi {
                         files.push(path.to_path_buf());
                     }
                 }
@@ -202,11 +239,28 @@ pub fn iter_session_files(dir: &Path, start_ms: i64, end_ms: i64) -> Vec<PathBuf
 
 pub trait AgentProvider: Send + Sync {
     fn is_available(&self) -> bool;
+    /// Collect all data in one pass (more efficient than separate calls)
+    fn collect_all(&self, target: chrono::NaiveDate) -> DayData;
+
+    // Legacy methods - kept for interface compatibility but not used internally
+    #[allow(dead_code)]
     fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64);
+    #[allow(dead_code)]
     fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64;
+    #[allow(dead_code)]
     fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData;
 }
 
+/// Combined data for a single day - collected in one file traversal
+#[derive(Clone)]
+pub struct DayData {
+    pub tokens: u64,
+    pub tools: u64,
+    pub focus_min: f64,  // Total focus minutes for the day
+    pub hourly: HourlyData,
+}
+
+#[derive(Clone)]
 pub struct HourlyData {
     pub tokens: Vec<u64>,
     pub tools: Vec<u64>,
@@ -223,6 +277,17 @@ impl Default for HourlyData {
     }
 }
 
+impl Default for DayData {
+    fn default() -> Self {
+        DayData {
+            tokens: 0,
+            tools: 0,
+            focus_min: 0.0,
+            hourly: HourlyData::default(),
+        }
+    }
+}
+
 // ── Claude Code provider ──────────────────────────────────────────────────────
 
 pub struct ClaudeCodeProvider;
@@ -232,59 +297,73 @@ impl AgentProvider for ClaudeCodeProvider {
         config::claude_dir().exists()
     }
 
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+    /// Combined collection - single file traversal for efficiency
+    fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
+        let mut data = DayData::default();
         let projects_dir = config::claude_dir().join("projects");
-        if !projects_dir.exists() {
-            return (0, 0);
-        }
-        let mut tokens: u64 = 0;
-        let mut tool_calls: u64 = 0;
-        for file in iter_session_files(&projects_dir, start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                let ts_raw = match entry.get("timestamp") {
-                    Some(Value::String(s)) => s.as_str(),
-                    _ => continue,
-                };
-                let ts_ms = match iso_to_ms(ts_raw) {
-                    Some(ms) => ms,
-                    None => continue,
-                };
-                if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
-                }
-                if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                    continue;
-                }
-                let msg = match entry.get("message") {
-                    Some(Value::Object(m)) => m,
-                    _ => continue,
-                };
-                let usage = match msg.get("usage") {
-                    Some(Value::Object(u)) => u,
-                    _ => continue,
-                };
-                tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                tokens += usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                tokens += usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if let Some(Value::Array(content)) = msg.get("content") {
-                    for block in content {
-                        if let Value::Object(b) = block {
-                            if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                tool_calls += 1;
+
+        if projects_dir.exists() {
+            for file in iter_session_files(&projects_dir, start_ms, end_ms) {
+                process_jsonl(&file, |entry| {
+                    let ts_raw = match entry.get("timestamp") {
+                        Some(Value::String(s)) => s.as_str(),
+                        _ => return,
+                    };
+                    let ts_ms = match iso_to_ms(ts_raw) {
+                        Some(ms) => ms,
+                        None => return,
+                    };
+                    if !(start_ms..end_ms).contains(&ts_ms) {
+                        return;
+                    }
+                    if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+                        return;
+                    }
+                    let msg = match entry.get("message") {
+                        Some(Value::Object(m)) => m,
+                        _ => return,
+                    };
+                    let usage = match msg.get("usage") {
+                        Some(Value::Object(u)) => u,
+                        _ => return,
+                    };
+
+                    let hour = ms_to_local_hour(ts_ms) as usize;
+                    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let total_tokens = input_tokens + cache_read + cache_creation;
+
+                    data.tokens += total_tokens;
+                    data.hourly.tokens[hour] += total_tokens;
+
+                    if let Some(Value::Array(content)) = msg.get("content") {
+                        for block in content {
+                            if let Value::Object(b) = block {
+                                if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                                    data.tools += 1;
+                                    data.hourly.tools[hour] += 1;
+                                }
                             }
                         }
                     }
-                }
+                });
             }
         }
-        (tokens, tool_calls)
+
+        // Calculate focus from history (single read, shared with hourly)
+        let history_file = config::claude_dir().join("history.jsonl");
+        let sessions = read_history_sessions(&history_file, start_ms, end_ms, true);
+        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
+        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+
+        data
+    }
+
+    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+        let data = self.collect_all(target);
+        (data.tokens, data.tools)
     }
 
     fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
@@ -295,60 +374,7 @@ impl AgentProvider for ClaudeCodeProvider {
     }
 
     fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut data = HourlyData::default();
-        let projects_dir = config::claude_dir().join("projects");
-        if projects_dir.exists() {
-            for file in iter_session_files(&projects_dir, start_ms, end_ms) {
-                for entry in read_jsonl(&file) {
-                    let ts_raw = match entry.get("timestamp") {
-                        Some(Value::String(s)) => s.as_str(),
-                        _ => continue,
-                    };
-                    let ts_ms = match iso_to_ms(ts_raw) {
-                        Some(ms) => ms,
-                        None => continue,
-                    };
-                    if !(start_ms..end_ms).contains(&ts_ms) {
-                        continue;
-                    }
-                    if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                        continue;
-                    }
-                    let hour = ms_to_local_hour(ts_ms) as usize;
-                    let msg = match entry.get("message") {
-                        Some(Value::Object(m)) => m,
-                        _ => continue,
-                    };
-                    let usage = match msg.get("usage") {
-                        Some(Value::Object(u)) => u,
-                        _ => continue,
-                    };
-                    data.tokens[hour] += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    data.tokens[hour] += usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    data.tokens[hour] += usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    if let Some(Value::Array(content)) = msg.get("content") {
-                        for block in content {
-                            if let Value::Object(b) = block {
-                                if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                    data.tools[hour] += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let history_file = config::claude_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, true);
-        data.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
-        data
+        self.collect_all(target).hourly
     }
 }
 
@@ -441,27 +467,45 @@ impl AgentProvider for CodexProvider {
         config::codex_dir().exists()
     }
 
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+    fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut tokens: u64 = 0;
-        let mut tool_calls: u64 = 0;
+        let mut data = DayData::default();
+
         for file in iter_session_files(&config::codex_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                if !self.is_assistant(&entry) {
-                    continue;
+            process_jsonl(&file, |entry| {
+                if !self.is_assistant(entry) {
+                    return;
                 }
-                let ts_ms = match self.parse_ts(&entry) {
+                let ts_ms = match self.parse_ts(entry) {
                     Some(ms) => ms,
-                    None => continue,
+                    None => return,
                 };
                 if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
+                    return;
                 }
-                tokens += self.extract_tokens(&entry);
-                tool_calls += self.extract_tool_calls(&entry);
-            }
+                let hour = ms_to_local_hour(ts_ms) as usize;
+                let tokens = self.extract_tokens(entry);
+                let tools = self.extract_tool_calls(entry);
+
+                data.tokens += tokens;
+                data.tools += tools;
+                data.hourly.tokens[hour] += tokens;
+                data.hourly.tools[hour] += tools;
+            });
         }
-        (tokens, tool_calls)
+
+        // Calculate focus from history (single read)
+        let history_file = config::codex_dir().join("history.jsonl");
+        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
+        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
+        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+
+        data
+    }
+
+    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+        let data = self.collect_all(target);
+        (data.tokens, data.tools)
     }
 
     fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
@@ -472,29 +516,7 @@ impl AgentProvider for CodexProvider {
     }
 
     fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut data = HourlyData::default();
-        for file in iter_session_files(&config::codex_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                if !self.is_assistant(&entry) {
-                    continue;
-                }
-                let ts_ms = match self.parse_ts(&entry) {
-                    Some(ms) => ms,
-                    None => continue,
-                };
-                if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
-                }
-                let hour = ms_to_local_hour(ts_ms) as usize;
-                data.tokens[hour] += self.extract_tokens(&entry);
-                data.tools[hour] += self.extract_tool_calls(&entry);
-            }
-        }
-        let history_file = config::codex_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        data.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
-        data
+        self.collect_all(target).hourly
     }
 }
 
@@ -584,27 +606,50 @@ impl AgentProvider for GeminiProvider {
         config::gemini_dir().exists()
     }
 
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+    fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut tokens: u64 = 0;
-        let mut tool_calls: u64 = 0;
+        let mut data = DayData::default();
+
         for file in iter_session_files(&config::gemini_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                if !self.is_model_response(&entry) {
-                    continue;
+            process_jsonl(&file, |entry| {
+                if !self.is_model_response(entry) {
+                    return;
                 }
-                let ts_ms = match self.parse_ts(&entry) {
+                let ts_ms = match self.parse_ts(entry) {
                     Some(ms) => ms,
-                    None => continue,
+                    None => return,
                 };
                 if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
+                    return;
                 }
-                tokens += self.extract_tokens(&entry);
-                tool_calls += self.extract_tool_calls(&entry);
+                let hour = ms_to_local_hour(ts_ms) as usize;
+                let tokens = self.extract_tokens(entry);
+                let tools = self.extract_tool_calls(entry);
+
+                data.tokens += tokens;
+                data.tools += tools;
+                data.hourly.tokens[hour] += tokens;
+                data.hourly.tools[hour] += tools;
+            });
+        }
+
+        // Calculate focus from history (single read)
+        for name in &["history.jsonl", "history"] {
+            let history = config::gemini_dir().join(name);
+            if history.exists() {
+                let sessions = read_history_sessions(&history, start_ms, end_ms, false);
+                data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
+                data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+                break;
             }
         }
-        (tokens, tool_calls)
+
+        data
+    }
+
+    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+        let data = self.collect_all(target);
+        (data.tokens, data.tools)
     }
 
     fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
@@ -623,34 +668,7 @@ impl AgentProvider for GeminiProvider {
     }
 
     fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut data = HourlyData::default();
-        for file in iter_session_files(&config::gemini_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                if !self.is_model_response(&entry) {
-                    continue;
-                }
-                let ts_ms = match self.parse_ts(&entry) {
-                    Some(ms) => ms,
-                    None => continue,
-                };
-                if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
-                }
-                let hour = ms_to_local_hour(ts_ms) as usize;
-                data.tokens[hour] += self.extract_tokens(&entry);
-                data.tools[hour] += self.extract_tool_calls(&entry);
-            }
-        }
-        for name in &["history.jsonl", "history"] {
-            let history = config::gemini_dir().join(name);
-            if history.exists() {
-                let sessions = read_history_sessions(&history, start_ms, end_ms, false);
-                data.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
-                break;
-            }
-        }
-        data
+        self.collect_all(target).hourly
     }
 }
 
@@ -663,55 +681,69 @@ impl AgentProvider for OpenCodeProvider {
         config::opencode_dir().exists()
     }
 
-    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+    fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut tokens: u64 = 0;
-        let mut tool_calls: u64 = 0;
+        let mut data = DayData::default();
+
         for file in iter_session_files(&config::opencode_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
+            process_jsonl(&file, |entry| {
                 let ts_raw = match entry.get("timestamp") {
                     Some(Value::String(s)) => s.as_str(),
-                    _ => continue,
+                    _ => return,
                 };
                 let ts_ms = match iso_to_ms(ts_raw) {
                     Some(ms) => ms,
-                    None => continue,
+                    None => return,
                 };
                 if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
+                    return;
                 }
                 if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                    continue;
+                    return;
                 }
                 let msg = match entry.get("message") {
                     Some(Value::Object(m)) => m,
-                    _ => continue,
+                    _ => return,
                 };
                 let usage = match msg.get("usage") {
                     Some(Value::Object(u)) => u,
-                    _ => continue,
+                    _ => return,
                 };
-                tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                tokens += usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                tokens += usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+
+                let hour = ms_to_local_hour(ts_ms) as usize;
+                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total_tokens = input_tokens + cache_read + cache_creation;
+
+                data.tokens += total_tokens;
+                data.hourly.tokens[hour] += total_tokens;
+
                 if let Some(Value::Array(content)) = msg.get("content") {
                     for block in content {
                         if let Value::Object(b) = block {
                             if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                tool_calls += 1;
+                                data.tools += 1;
+                                data.hourly.tools[hour] += 1;
                             }
                         }
                     }
                 }
-            }
+            });
         }
-        (tokens, tool_calls)
+
+        // Calculate focus from history (single read)
+        let history_file = config::opencode_dir().join("history.jsonl");
+        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
+        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
+        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+
+        data
+    }
+
+    fn collect_tokens_and_tools(&self, target: chrono::NaiveDate) -> (u64, u64) {
+        let data = self.collect_all(target);
+        (data.tokens, data.tools)
     }
 
     fn collect_focus_minutes(&self, target: chrono::NaiveDate) -> f64 {
@@ -722,56 +754,6 @@ impl AgentProvider for OpenCodeProvider {
     }
 
     fn collect_hourly(&self, target: chrono::NaiveDate) -> HourlyData {
-        let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
-        let mut data = HourlyData::default();
-        for file in iter_session_files(&config::opencode_dir(), start_ms, end_ms) {
-            for entry in read_jsonl(&file) {
-                let ts_raw = match entry.get("timestamp") {
-                    Some(Value::String(s)) => s.as_str(),
-                    _ => continue,
-                };
-                let ts_ms = match iso_to_ms(ts_raw) {
-                    Some(ms) => ms,
-                    None => continue,
-                };
-                if !(start_ms..end_ms).contains(&ts_ms) {
-                    continue;
-                }
-                if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                    continue;
-                }
-                let hour = ms_to_local_hour(ts_ms) as usize;
-                let msg = match entry.get("message") {
-                    Some(Value::Object(m)) => m,
-                    _ => continue,
-                };
-                let usage = match msg.get("usage") {
-                    Some(Value::Object(u)) => u,
-                    _ => continue,
-                };
-                data.tokens[hour] += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                data.tokens[hour] += usage
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                data.tokens[hour] += usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if let Some(Value::Array(content)) = msg.get("content") {
-                    for block in content {
-                        if let Value::Object(b) = block {
-                            if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                data.tools[hour] += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let history_file = config::opencode_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        data.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
-        data
+        self.collect_all(target).hourly
     }
 }

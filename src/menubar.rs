@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject};
-use objc2::{define_class, msg_send, msg_send_id, class, ClassType};
+use objc2::runtime::{AnyObject, NSObject};
+use objc2::{define_class, msg_send, msg_send_id, ClassType};
 use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSView};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 
 use crate::config::load_config;
-use crate::data_collector::{calc_streak, collect_day_metrics, collect_history};
+use crate::data_collector::{calc_streak, collect_day_metrics, collect_history, clear_all_cache};
 use crate::server::PORT;
 
-const REFRESH_INTERVAL: u64 = 60;
+const REFRESH_INTERVAL: u64 = 300; // 5 minutes
 
 // ── Ring definitions (radius, r, g, b) — matches style.css ───────────────────
 
@@ -162,6 +162,7 @@ struct MenuBarUI {
     item_focus: Retained<AnyObject>,
     item_tools: Retained<AnyObject>,
     item_streak: Retained<AnyObject>,
+    item_refresh: Retained<AnyObject>,
     item_open: Retained<AnyObject>,
 }
 
@@ -219,6 +220,12 @@ define_class!(
         unsafe fn timer_fired(&self, _sender: Option<&AnyObject>) {
             refresh_stats();
         }
+
+        #[unsafe(method(refreshNow:))]
+        unsafe fn refresh_now(&self, _sender: Option<&AnyObject>) {
+            clear_all_cache();
+            dispatch_force_refresh();
+        }
     }
 );
 
@@ -241,22 +248,6 @@ fn refresh_stats() {
         let tp = metrics.token_pct.unwrap_or(0.0);
         let fp = metrics.focus_pct.unwrap_or(0.0);
         let ap = metrics.tool_pct.unwrap_or(0.0);
-        let lowest = tp.min(fp).min(ap);
-
-        let title_str = if lowest >= 1.0 {
-            "⬤".to_string()
-        } else {
-            format!("{}%", (lowest * 100.0).round() as u32)
-        };
-
-        unsafe {
-            // Update status bar button title
-            let ptr = DELEGATE_PTR.load(Ordering::Acquire);
-            if !ptr.is_null() {
-                // Get status item via global ref — we use the button stored separately
-                // Actually, let's store button reference in MenuBarUI too
-            }
-        }
 
         // Update ring view
         ui.rings_view.update_pcts([tp, fp, ap]);
@@ -267,12 +258,13 @@ fn refresh_stats() {
         let foc_str = format!("{}", metrics.focus_min.round() as u64);
         let tol_str = metrics.tool_calls.to_string();
 
-        let (tokens_title, focus_title, tools_title, streak_title, open_title) = if zh {
+        let (tokens_title, focus_title, tools_title, streak_title, refresh_title, open_title) = if zh {
             (
                 format!("消耗   {tok_str} / {tok_goal}  ({})", fmt_pct(tp)),
                 format!("专注   {foc_str} / {} 分钟  ({})", goals.focus_min, fmt_pct(fp)),
                 format!("行动   {tol_str} / {} 次  ({})", goals.tool_calls, fmt_pct(ap)),
                 format!("🔥  连续达标 {streak} 天"),
+                "立即刷新".to_string(),
                 "打开看板 ↗".to_string(),
             )
         } else {
@@ -281,6 +273,7 @@ fn refresh_stats() {
                 format!("Focus   {foc_str} / {} min  ({})", goals.focus_min, fmt_pct(fp)),
                 format!("Action   {tol_str} / {} calls  ({})", goals.tool_calls, fmt_pct(ap)),
                 format!("🔥  {streak}-day streak"),
+                "Refresh Now".to_string(),
                 "Open Dashboard ↗".to_string(),
             )
         };
@@ -290,6 +283,7 @@ fn refresh_stats() {
             let _: () = msg_send![&*ui.item_focus, setTitle: &*NSString::from_str(&focus_title)];
             let _: () = msg_send![&*ui.item_tools, setTitle: &*NSString::from_str(&tools_title)];
             let _: () = msg_send![&*ui.item_streak, setTitle: &*NSString::from_str(&streak_title)];
+            let _: () = msg_send![&*ui.item_refresh, setTitle: &*NSString::from_str(&refresh_title)];
             let _: () = msg_send![&*ui.item_open, setTitle: &*NSString::from_str(&open_title)];
         }
     });
@@ -413,6 +407,13 @@ pub fn run_menubar() {
         let sep4: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
         let _: () = msg_send![&menu, addItem: &*sep4];
 
+        // Refresh now
+        let item_refresh: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let _: () = msg_send![&item_refresh, setTitle: &*NSString::from_str("Refresh Now")];
+        let _: () = msg_send![&item_refresh, setTarget: &*delegate];
+        let _: () = msg_send![&item_refresh, setAction: objc2::sel!(refreshNow:)];
+        let _: () = msg_send![&menu, addItem: &*item_refresh];
+
         // Open dashboard
         let item_open: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_open, setTitle: &*NSString::from_str("Open Dashboard ↗")];
@@ -441,6 +442,7 @@ pub fn run_menubar() {
             item_focus,
             item_tools,
             item_streak,
+            item_refresh,
             item_open,
         });
 
@@ -464,6 +466,22 @@ pub fn run_menubar() {
 }
 
 fn dispatch_refresh() {
+    let ptr = DELEGATE_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let obj: &AnyObject = &*ptr;
+        let _: () = msg_send![
+            obj,
+            performSelectorOnMainThread: objc2::sel!(timerFired:)
+            withObject: std::ptr::null::<AnyObject>()
+            waitUntilDone: false
+        ];
+    }
+}
+
+fn dispatch_force_refresh() {
     let ptr = DELEGATE_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         return;

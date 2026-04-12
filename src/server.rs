@@ -1,5 +1,4 @@
 use axum::extract::Query;
-use axum::response::Html;
 use axum::{extract::State, routing::get, routing::post, Json, Router};
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -7,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 
-use crate::config::{load_config, save_config, Goals};
+use crate::config::{load_config, save_config};
 use crate::data_collector::{
     agent_meta, calc_streak, collect_day_metrics, collect_history, collect_hourly, providers,
 };
@@ -22,6 +21,7 @@ pub struct AppState {
 
 pub type SharedState = Arc<RwLock<AppState>>;
 
+#[allow(dead_code)]
 pub fn make_state() -> SharedState {
     Arc::new(RwLock::new(AppState {
         goals_changed_callbacks: Vec::new(),
@@ -72,7 +72,7 @@ pub fn build_router(static_dir: String, state: SharedState) -> Router {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-async fn api_today(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn api_today(State(_state): State<SharedState>) -> Json<serde_json::Value> {
     let goals = load_config();
     let today = chrono::Local::now().date_naive();
     let metrics = collect_day_metrics(today, &goals);
@@ -239,8 +239,6 @@ async fn api_hourly(Query(query): Query<HourlyQuery>) -> Result<Json<serde_json:
         "tokens" => (&hourly.tokens, day_metrics.tokens, goals.tokens),
         "tools" => (&hourly.tools, day_metrics.tool_calls, goals.tool_calls),
         "focus" => {
-            let focus_u64: Vec<u64> = hourly.focus.iter().map(|f| (f * 10.0).round() as u64 / 10).collect();
-            let total_focus = (day_metrics.focus_min * 10.0).round() as u64;
             return Ok(Json(serde_json::json!({
                 "metric": metric,
                 "date": target.to_string(),

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::Goals;
 use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, OpenCodeProvider, AgentProvider,
+    HourlyData,
 };
 
 // ── Provider registry ─────────────────────────────────────────────────────────
@@ -64,67 +65,116 @@ impl DayMetrics {
     }
 }
 
-// ── Cache ─────────────────────────────────────────────────────────────────────
+// ── Cache (includes hourly data for efficiency) ────────────────────────────────
 
-static CACHE: LazyLock<Mutex<HashMap<String, (u64, DayMetrics)>>> =
+/// Cached day data - includes both metrics and hourly breakdown
+struct CachedDayData {
+    timestamp: u64,
+    metrics: DayMetrics,
+    hourly: HourlyData,
+}
+
+const CACHE_EXPIRY_SECS: u64 = 3600; // 1 hour
+
+static CACHE: LazyLock<Mutex<HashMap<String, CachedDayData>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn cache_key(target: &NaiveDate, goals: &Goals) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / 60;
     format!(
-        "{}_{}_{}_{}_{:?}",
-        now, target, goals.tokens, goals.focus_min, goals.enabled_agents
+        "{}_{}_{}_{}",
+        target, goals.tokens, goals.focus_min, goals.enabled_agents.join(",")
     )
 }
 
+/// Remove expired entries from cache
+fn cleanup_cache(cache: &mut HashMap<String, CachedDayData>) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    cache.retain(|_, v| now - v.timestamp < CACHE_EXPIRY_SECS);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// Collect all data for a day in one pass - returns both metrics and hourly
+fn collect_day_data(target: NaiveDate, goals: &Goals) -> CachedDayData {
+    let provs = active_providers(goals);
+    let mut total_tokens: u64 = 0;
+    let mut total_tools: u64 = 0;
+    let mut total_focus: f64 = 0.0;
+    let mut hourly_tokens = vec![0u64; 24];
+    let mut hourly_tools = vec![0u64; 24];
+    let mut hourly_focus = vec![0.0f64; 24];
+
+    for p in &provs {
+        let data = p.collect_all(target);
+        total_tokens += data.tokens;
+        total_tools += data.tools;
+        total_focus += data.focus_min;  // Use focus from collect_all, avoid duplicate read
+        for h in 0..24 {
+            hourly_tokens[h] += data.hourly.tokens[h];
+            hourly_tools[h] += data.hourly.tools[h];
+            hourly_focus[h] += data.hourly.focus[h];
+        }
+    }
+
+    let metrics = DayMetrics {
+        date: target.to_string(),
+        tokens: total_tokens,
+        tool_calls: total_tools,
+        focus_min: (total_focus * 10.0).round() / 10.0,
+        token_pct: None,
+        tool_pct: None,
+        focus_pct: None,
+    }.with_goals(goals);
+
+    let hourly = HourlyData {
+        tokens: hourly_tokens,
+        tools: hourly_tools,
+        focus: hourly_focus,
+    };
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    CachedDayData { timestamp, metrics, hourly }
+}
 
 pub fn collect_day_metrics(target: NaiveDate, goals: &Goals) -> DayMetrics {
     let key = cache_key(&target, goals);
     {
         let cache = CACHE.lock().unwrap();
-        if let Some((_, cached)) = cache.get(&key) {
-            return cached.clone();
+        if let Some(cached) = cache.get(&key) {
+            return cached.metrics.clone();
         }
     }
 
-    let provs = active_providers(goals);
-    let mut tokens: u64 = 0;
-    let mut tool_calls: u64 = 0;
-    let mut focus_min: f64 = 0.0;
-
-    for p in &provs {
-        let (t, tc) = p.collect_tokens_and_tools(target);
-        tokens += t;
-        tool_calls += tc;
-        focus_min += p.collect_focus_minutes(target);
-    }
-
-    let m = DayMetrics {
-        date: target.to_string(),
-        tokens,
-        tool_calls,
-        focus_min: (focus_min * 10.0).round() / 10.0,
-        token_pct: None,
-        tool_pct: None,
-        focus_pct: None,
-    }
-    .with_goals(goals);
-
+    let data = collect_day_data(target, goals);
+    let metrics = data.metrics.clone();
     {
         let mut cache = CACHE.lock().unwrap();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        cache.insert(key, (ts, m.clone()));
+        cleanup_cache(&mut cache);  // Remove expired entries
+        cache.insert(key, data);
     }
+    metrics
+}
 
-    m
+#[allow(dead_code)]
+pub fn collect_day_metrics_force(target: NaiveDate, goals: &Goals) -> DayMetrics {
+    let key = cache_key(&target, goals);
+    {
+        let mut cache = CACHE.lock().unwrap();
+        cache.remove(&key);
+    }
+    collect_day_metrics(target, goals)
+}
+
+pub fn clear_all_cache() {
+    let mut cache = CACHE.lock().unwrap();
+    cache.clear();
 }
 
 pub fn collect_history(goals: &Goals, days: usize) -> Vec<DayMetrics> {
@@ -149,27 +199,24 @@ pub fn calc_streak(history: &[DayMetrics]) -> u32 {
     streak
 }
 
-pub fn collect_hourly(target: NaiveDate, goals: &Goals) -> crate::providers::HourlyData {
-    use crate::providers::HourlyData;
-    let provs = active_providers(goals);
-    let mut tokens_h = vec![0u64; 24];
-    let mut tools_h = vec![0u64; 24];
-    let mut focus_h = vec![0.0f64; 24];
-
-    for p in &provs {
-        let hourly = p.collect_hourly(target);
-        for h in 0..24 {
-            tokens_h[h] += hourly.tokens[h];
-            tools_h[h] += hourly.tools[h];
-            focus_h[h] += hourly.focus[h];
+/// Collect hourly data - uses shared cache with collect_day_metrics
+pub fn collect_hourly(target: NaiveDate, goals: &Goals) -> HourlyData {
+    let key = cache_key(&target, goals);
+    {
+        let cache = CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(&key) {
+            return cached.hourly.clone();
         }
     }
 
-    HourlyData {
-        tokens: tokens_h,
-        tools: tools_h,
-        focus: focus_h,
+    let data = collect_day_data(target, goals);
+    let hourly = data.hourly.clone();
+    {
+        let mut cache = CACHE.lock().unwrap();
+        cleanup_cache(&mut cache);  // Remove expired entries
+        cache.insert(key, data);
     }
+    hourly
 }
 
 // ── Agent meta ────────────────────────────────────────────────────────────────

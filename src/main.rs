@@ -33,7 +33,7 @@ fn main() {
 
     if !foreground {
         // Check if already running by trying to connect to the port
-        if let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", server::PORT)) {
+        if let Ok(_stream) = std::net::TcpStream::connect(("127.0.0.1", server::PORT)) {
             eprintln!("Vibe Coding Rings is already running on port {}", server::PORT);
             // Open dashboard in browser
             let _ = std::process::Command::new("open")

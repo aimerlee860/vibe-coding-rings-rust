@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::Goals;
+use crate::config::{Goals, StreakCache};
 use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, OpenCodeProvider, AgentProvider,
     HourlyData,
@@ -197,6 +197,86 @@ pub fn calc_streak(history: &[DayMetrics]) -> u32 {
         }
     }
     streak
+}
+
+/// Check if a single day meets all goals
+fn day_meets_goals(metrics: &DayMetrics) -> bool {
+    let token_ok = metrics.token_pct.unwrap_or(0.0) >= 1.0;
+    let focus_ok = metrics.focus_pct.unwrap_or(0.0) >= 1.0;
+    let tool_ok = metrics.tool_pct.unwrap_or(0.0) >= 1.0;
+    token_ok && focus_ok && tool_ok
+}
+
+/// Get cached base streak (streak up to yesterday) and update cache if needed
+/// Returns (base_streak, needs_full_recalc)
+pub fn get_cached_base_streak(goals: &Goals) -> (u32, bool) {
+    let today = Local::now().date_naive();
+    let today_str = today.to_string();
+
+    // Check if cache exists and is for today's calculation
+    if let Some(cache) = &goals.streak_cache {
+        // Cache is valid if last_date == today (meaning we already computed base_streak for yesterday)
+        if cache.last_date == today_str {
+            return (cache.base_streak, false);
+        }
+
+        // If cache is from yesterday, it's still valid for base_streak
+        let yesterday = today - Duration::days(1);
+        if cache.last_date == yesterday.to_string() {
+            return (cache.base_streak, false);
+        }
+    }
+
+    // Cache is stale or missing - need full recalculation
+    (0, true)
+}
+
+/// Update streak cache after computing history
+pub fn update_streak_cache(history: &[DayMetrics], goals: &mut Goals) {
+    let today = Local::now().date_naive();
+
+    // history[0] is today, history[1] is yesterday, etc.
+    // base_streak should be streak counting from yesterday backwards
+    let base_streak = if history.len() > 1 {
+        // Skip today, count streak from yesterday
+        let mut streak: u32 = 0;
+        for day in &history[1..] {
+            if day_meets_goals(day) {
+                streak += 1;
+            } else {
+                break;
+            }
+        }
+        streak
+    } else {
+        0
+    };
+
+    goals.streak_cache = Some(StreakCache {
+        base_streak,
+        last_date: today.to_string(),
+    });
+    crate::config::save_config(goals);
+}
+
+/// Calculate streak efficiently: use cache + today's data
+pub fn calc_streak_fast(today_metrics: &DayMetrics, goals: &Goals) -> u32 {
+    let (base_streak, needs_recalc) = get_cached_base_streak(goals);
+
+    if needs_recalc {
+        // Cache is stale, need to compute from history
+        let history = collect_history(goals, 7);
+        let mut goals_mut = goals.clone();
+        update_streak_cache(&history, &mut goals_mut);
+        return calc_streak(&history);
+    }
+
+    // Use cache: if today meets goals, streak = base + 1
+    if day_meets_goals(today_metrics) {
+        base_streak + 1
+    } else {
+        0
+    }
 }
 
 /// Collect hourly data - uses shared cache with collect_day_metrics

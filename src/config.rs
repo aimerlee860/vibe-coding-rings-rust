@@ -52,6 +52,14 @@ pub struct Goals {
     pub lang: String,
     #[serde(default = "default_agents")]
     pub enabled_agents: Vec<String>,
+    #[serde(default)]
+    pub streak_cache: Option<StreakCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreakCache {
+    pub base_streak: u32,      // 昨天结束时的连续达标天数
+    pub last_date: String,     // 最后计算的日期 (YYYY-MM-DD)
 }
 
 fn default_tokens() -> u64 { 1_000_000 }
@@ -68,6 +76,7 @@ impl Default for Goals {
             tool_calls: default_tool_calls(),
             lang: default_lang(),
             enabled_agents: default_agents(),
+            streak_cache: None,
         }
     }
 }

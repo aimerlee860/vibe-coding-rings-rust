@@ -1,19 +1,15 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, msg_send, msg_send_id, ClassType};
-use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSView};
+use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSMenu, NSView};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::time::Duration;
 
 use crate::config::load_config;
-use crate::data_collector::{calc_streak, collect_day_metrics, collect_history, clear_all_cache};
+use crate::data_collector::{calc_streak_fast, collect_day_metrics, clear_all_cache};
 use crate::server::PORT;
-
-const REFRESH_INTERVAL: u64 = 300; // 5 minutes
 
 // ── Ring definitions (radius, r, g, b) — matches style.css ───────────────────
 
@@ -170,11 +166,7 @@ thread_local! {
     static MENU_UI: RefCell<Option<Rc<MenuBarUI>>> = RefCell::new(None);
 }
 
-// ── Global delegate pointer for background thread dispatch ────────────────────
-
-static DELEGATE_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
-
-// ── MenuActionTarget — handles menu item clicks ──────────────────────────────
+// ── MenuActionTarget — handles menu item clicks and menu opening ──────────────
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -216,15 +208,16 @@ define_class!(
             std::process::exit(0);
         }
 
-        #[unsafe(method(timerFired:))]
-        unsafe fn timer_fired(&self, _sender: Option<&AnyObject>) {
-            refresh_stats();
-        }
-
         #[unsafe(method(refreshNow:))]
         unsafe fn refresh_now(&self, _sender: Option<&AnyObject>) {
             clear_all_cache();
-            dispatch_force_refresh();
+            refresh_stats();
+        }
+
+        // NSMenuDelegate method - called when menu is about to open
+        #[unsafe(method(menuWillOpen:))]
+        unsafe fn menu_will_open(&self, _menu: Option<&NSMenu>) {
+            refresh_stats();
         }
     }
 );
@@ -241,9 +234,10 @@ fn refresh_stats() {
         let goals = load_config();
         let zh = goals.lang == "zh";
         let today = chrono::Local::now().date_naive();
+        // 只获取当天数据，不再扫描7天历史
         let metrics = collect_day_metrics(today, &goals);
-        let history = collect_history(&goals, 7);
-        let streak = calc_streak(&history);
+        // 使用缓存计算 streak
+        let streak = calc_streak_fast(&metrics, &goals);
 
         let tp = metrics.token_pct.unwrap_or(0.0);
         let fp = metrics.focus_pct.unwrap_or(0.0);
@@ -337,7 +331,6 @@ pub fn run_menubar() {
 
         // Create delegate — use T::class() to ensure class registration
         let delegate: Retained<AnyObject> = msg_send_id![MenuActionTarget::class(), new];
-        DELEGATE_PTR.store((&*delegate) as *const AnyObject as *mut AnyObject, Ordering::Release);
 
         // Status bar
         let status_bar: Retained<AnyObject> = msg_send_id![objc2::class!(NSStatusBar), systemStatusBar];
@@ -435,6 +428,9 @@ pub fn run_menubar() {
         // Set menu on status item
         let _: () = msg_send![&status_item, setMenu: &*menu];
 
+        // Set menu delegate to receive menuWillOpen events
+        let _: () = msg_send![&menu, setDelegate: &*delegate];
+
         // Keep references alive
         let ui = Rc::new(MenuBarUI {
             rings_view,
@@ -450,49 +446,7 @@ pub fn run_menubar() {
             *cell.borrow_mut() = Some(ui);
         });
 
-        // Background timer thread
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(1500));
-            dispatch_refresh();
-            loop {
-                std::thread::sleep(Duration::from_secs(REFRESH_INTERVAL));
-                dispatch_refresh();
-            }
-        });
-
         // Run the app
         let _: () = msg_send![&app, run];
-    }
-}
-
-fn dispatch_refresh() {
-    let ptr = DELEGATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let obj: &AnyObject = &*ptr;
-        let _: () = msg_send![
-            obj,
-            performSelectorOnMainThread: objc2::sel!(timerFired:)
-            withObject: std::ptr::null::<AnyObject>()
-            waitUntilDone: false
-        ];
-    }
-}
-
-fn dispatch_force_refresh() {
-    let ptr = DELEGATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let obj: &AnyObject = &*ptr;
-        let _: () = msg_send![
-            obj,
-            performSelectorOnMainThread: objc2::sel!(timerFired:)
-            withObject: std::ptr::null::<AnyObject>()
-            waitUntilDone: false
-        ];
     }
 }

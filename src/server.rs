@@ -9,6 +9,7 @@ use tower_http::services::ServeDir;
 use crate::config::{load_config, save_config};
 use crate::data_collector::{
     agent_meta, calc_streak, collect_day_metrics, collect_history, collect_hourly, providers,
+    update_streak_cache,
 };
 
 pub const PORT: u16 = 9876;
@@ -73,11 +74,13 @@ pub fn build_router(static_dir: String, state: SharedState) -> Router {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn api_today(State(_state): State<SharedState>) -> Json<serde_json::Value> {
-    let goals = load_config();
+    let mut goals = load_config();
     let today = chrono::Local::now().date_naive();
     let metrics = collect_day_metrics(today, &goals);
     let history = collect_history(&goals, 7);
     let streak = calc_streak(&history);
+    // 更新 streak 缓存，以便菜单栏下次刷新使用
+    update_streak_cache(&history, &mut goals);
 
     Json(serde_json::json!({
         "metrics": {

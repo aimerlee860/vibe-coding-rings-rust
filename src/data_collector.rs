@@ -1,10 +1,33 @@
 use chrono::{Duration, Local, NaiveDate};
+use std::time::Instant;
 
 use crate::config::{Goals, StreakCache};
 use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, OpenCodeProvider, AgentProvider,
     HourlyData,
 };
+
+// ── 5-second data cache ───────────────────────────────────────────────────────
+
+const CACHE_TTL_SECS: u64 = 5;
+
+struct DayCache {
+    refreshed_at: Instant,
+    date: NaiveDate,
+    metrics: DayMetrics,
+    hourly: HourlyData,
+}
+
+struct HistoryCache {
+    refreshed_at: Instant,
+    days: usize,
+    data: Vec<DayMetrics>,
+}
+
+static DAY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<DayCache>>> =
+    std::sync::OnceLock::new();
+static HISTORY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<HistoryCache>>> =
+    std::sync::OnceLock::new();
 
 // ── Provider registry ─────────────────────────────────────────────────────────
 
@@ -66,6 +89,16 @@ impl DayMetrics {
 
 /// Collect all data for a day in one pass - returns both metrics and hourly breakdown
 fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData) {
+    // Check cache — skip file I/O if data was collected within TTL
+    if let Some(cache) = DAY_CACHE.get() {
+        let guard = cache.lock().unwrap();
+        if let Some(ref c) = *guard {
+            if c.date == target && c.refreshed_at.elapsed().as_secs() < CACHE_TTL_SECS {
+                return (c.metrics.clone(), c.hourly.clone());
+            }
+        }
+    }
+
     let provs = active_providers(goals);
     let mut total_tokens: u64 = 0;
     let mut total_tools: u64 = 0;
@@ -102,6 +135,15 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
         focus: hourly_focus,
     };
 
+    // Update cache
+    let cache = DAY_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    *cache.lock().unwrap() = Some(DayCache {
+        refreshed_at: Instant::now(),
+        date: target,
+        metrics: metrics.clone(),
+        hourly: hourly.clone(),
+    });
+
     (metrics, hourly)
 }
 
@@ -116,10 +158,30 @@ pub fn collect_day_full(target: NaiveDate, goals: &Goals) -> (DayMetrics, Hourly
 }
 
 pub fn collect_history(goals: &Goals, days: usize) -> Vec<DayMetrics> {
+    // Check cache — skip file I/O if data was collected within TTL
+    if let Some(cache) = HISTORY_CACHE.get() {
+        let guard = cache.lock().unwrap();
+        if let Some(ref c) = *guard {
+            if c.days == days && c.refreshed_at.elapsed().as_secs() < CACHE_TTL_SECS {
+                return c.data.clone();
+            }
+        }
+    }
+
     let today = Local::now().date_naive();
-    (0..days)
+    let history: Vec<DayMetrics> = (0..days)
         .map(|i| collect_day_metrics(today - Duration::days(i as i64), goals))
-        .collect()
+        .collect();
+
+    // Update cache
+    let cache = HISTORY_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    *cache.lock().unwrap() = Some(HistoryCache {
+        refreshed_at: Instant::now(),
+        days,
+        data: history.clone(),
+    });
+
+    history
 }
 
 pub fn calc_streak(history: &[DayMetrics]) -> u32 {

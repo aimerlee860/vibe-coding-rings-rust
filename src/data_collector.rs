@@ -279,11 +279,6 @@ pub fn calc_streak_fast(today_metrics: &DayMetrics, goals: &Goals) -> u32 {
     }
 }
 
-/// Collect hourly data - no caching, always fresh data
-pub fn collect_hourly(target: NaiveDate, goals: &Goals) -> HourlyData {
-    collect_day_data(target, goals).1
-}
-
 // ── Agent meta ────────────────────────────────────────────────────────────────
 
 pub struct AgentMeta {

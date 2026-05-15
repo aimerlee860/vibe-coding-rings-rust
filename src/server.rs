@@ -1,10 +1,11 @@
 use axum::extract::Query;
+use axum::response::{IntoResponse, Response};
 use axum::{extract::State, routing::get, routing::post, Json, Router};
 use chrono::NaiveDate;
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::services::ServeDir;
 
 use crate::config::{load_config, save_config};
 use crate::data_collector::{
@@ -54,9 +55,43 @@ struct HourlyQuery {
     d: Option<String>,
 }
 
+// ── Embedded static files ─────────────────────────────────────────────────────
+
+#[derive(RustEmbed)]
+#[folder = "static/"]
+struct Asset;
+
+fn mime_from_path(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn static_handler(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match Asset::get(path) {
+        Some(content) => {
+            let mime = mime_from_path(path);
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", mime)],
+                content.data.to_vec(),
+            )
+                .into_response()
+        }
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 // ── API routes ────────────────────────────────────────────────────────────────
 
-pub fn build_router(static_dir: String, state: SharedState) -> Router {
+pub fn build_router(state: SharedState) -> Router {
     let api = Router::new()
         .route("/api/today", get(api_today))
         .route("/api/history", get(api_history))
@@ -66,9 +101,7 @@ pub fn build_router(static_dir: String, state: SharedState) -> Router {
         .route("/api/hourly", get(api_hourly))
         .with_state(state);
 
-    let static_service = ServeDir::new(&static_dir).append_index_html_on_directories(true);
-
-    Router::new().merge(api).fallback_service(static_service)
+    Router::new().merge(api).fallback(static_handler)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -265,13 +298,13 @@ async fn api_hourly(Query(query): Query<HourlyQuery>) -> Result<Json<serde_json:
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
-pub fn start_server(static_dir: String, state: SharedState) {
+pub fn start_server(state: SharedState) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async move {
-        let router = build_router(static_dir, state);
+        let router = build_router(state);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], PORT));
         let listener = tokio::net::TcpListener::bind(addr)
             .await

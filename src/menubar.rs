@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, msg_send_id, ClassType, MainThreadOnly};
+use objc2::{define_class, msg_send, ClassType, MainThreadOnly};
 use objc2_app_kit::{NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSView};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::cell::RefCell;
@@ -57,20 +57,20 @@ define_class!(
                 unsafe {
                     let dim: &AnyObject = msg_send![
                         objc2::class!(NSColor),
-                        colorWithCalibratedRed: r * 0.18
-                        green: g * 0.18
-                        blue: b * 0.18
-                        alpha: 1.0
+                        colorWithCalibratedRed: r * 0.18,
+                        green: g * 0.18,
+                        blue: b * 0.18,
+                        alpha: 1.0,
                     ];
                     let _: () = msg_send![dim, set];
                     let track: &AnyObject = msg_send![objc2::class!(NSBezierPath), bezierPath];
                     let _: () = msg_send![track, setLineWidth: TRACK_W];
                     let _: () = msg_send![
                         track,
-                        appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy)
-                        radius: *radius
-                        startAngle: 0.0
-                        endAngle: 360.0
+                        appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy),
+                        radius: *radius,
+                        startAngle: 0.0,
+                        endAngle: 360.0,
                     ];
                     let _: () = msg_send![track, stroke];
                 }
@@ -83,10 +83,10 @@ define_class!(
                 unsafe {
                     let color: &AnyObject = msg_send![
                         objc2::class!(NSColor),
-                        colorWithCalibratedRed: *r
-                        green: *g
-                        blue: *b
-                        alpha: 1.0
+                        colorWithCalibratedRed: *r,
+                        green: *g,
+                        blue: *b,
+                        alpha: 1.0,
                     ];
                     let _: () = msg_send![color, set];
                     let arc: &AnyObject = msg_send![objc2::class!(NSBezierPath), bezierPath];
@@ -96,19 +96,19 @@ define_class!(
                     if capped >= 1.0 {
                         let _: () = msg_send![
                             arc,
-                            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy)
-                            radius: *radius
-                            startAngle: 0.0
-                            endAngle: 360.0
+                            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy),
+                            radius: *radius,
+                            startAngle: 0.0,
+                            endAngle: 360.0,
                         ];
                     } else {
                         let _: () = msg_send![
                             arc,
-                            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy)
-                            radius: *radius
-                            startAngle: 90.0
-                            endAngle: 90.0 - capped * 360.0
-                            clockwise: true
+                            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy),
+                            radius: *radius,
+                            startAngle: 90.0,
+                            endAngle: 90.0 - capped * 360.0,
+                            clockwise: true,
                         ];
                     }
                     let _: () = msg_send![arc, stroke];
@@ -302,10 +302,10 @@ unsafe fn create_ring_icon() -> Retained<NSImage> {
         let _: () = msg_send![path, setLineWidth: line_width];
         let _: () = msg_send![
             path,
-            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy)
-            radius: *radius
-            startAngle: 0.0
-            endAngle: 360.0
+            appendBezierPathWithArcWithCenter: NSPoint::new(cx, cy),
+            radius: *radius,
+            startAngle: 0.0,
+            endAngle: 360.0,
         ];
         let _: () = msg_send![path, stroke];
     }
@@ -321,25 +321,25 @@ unsafe fn create_ring_icon() -> Retained<NSImage> {
 pub fn run_menubar() {
     unsafe {
         // NSApplication
-        let app: Retained<AnyObject> = msg_send_id![objc2::class!(NSApplication), sharedApplication];
-        let _: () = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Accessory];
+        let app: Retained<AnyObject> = msg_send![objc2::class!(NSApplication), sharedApplication];
+        let _: bool = msg_send![&app, setActivationPolicy: NSApplicationActivationPolicy::Accessory];
 
         // Create delegate — use T::class() to ensure class registration
-        let delegate: Retained<MenuActionTarget> = msg_send_id![MenuActionTarget::class(), new];
+        let delegate: Retained<MenuActionTarget> = msg_send![MenuActionTarget::class(), new];
 
         // Status bar
-        let status_bar: Retained<AnyObject> = msg_send_id![objc2::class!(NSStatusBar), systemStatusBar];
-        let status_item: Retained<AnyObject> = msg_send_id![&status_bar, statusItemWithLength: -1.0];
+        let status_bar: Retained<AnyObject> = msg_send![objc2::class!(NSStatusBar), systemStatusBar];
+        let status_item: Retained<AnyObject> = msg_send![&status_bar, statusItemWithLength: -1.0];
 
-        let button: Retained<AnyObject> = msg_send_id![&status_item, button];
+        let button: Retained<AnyObject> = msg_send![&status_item, button];
         let icon = create_ring_icon();
         let _: () = msg_send![&button, setImage: &*icon];
 
         // Menu
-        let menu: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenu), new];
+        let menu: Retained<AnyObject> = msg_send![objc2::class!(NSMenu), new];
 
         // Header
-        let item_header: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_header: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_header, setTitle: &*NSString::from_str("VIBE CODING RINGS")];
         let _: () = msg_send![&item_header, setEnabled: false];
         let _: () = msg_send![&menu, addItem: &*item_header];
@@ -349,7 +349,7 @@ pub fn run_menubar() {
         let _: () = msg_send![&menu, addItem: &*sep];
 
         // Rings view
-        let item_rings: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_rings: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_rings, setEnabled: false];
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(VIEW_W, VIEW_H));
         let rings_alloc: *mut AnyObject = msg_send![VibeRingsView::class(), alloc];
@@ -363,19 +363,19 @@ pub fn run_menubar() {
         let _: () = msg_send![&menu, addItem: &*sep2];
 
         // Metric items
-        let item_tokens: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_tokens: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_tokens, setTitle: &*NSString::from_str("—")];
         let _: () = msg_send![&item_tokens, setTarget: &*delegate];
         let _: () = msg_send![&item_tokens, setAction: objc2::sel!(openDetailTokens:)];
         let _: () = msg_send![&menu, addItem: &*item_tokens];
 
-        let item_focus: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_focus: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_focus, setTitle: &*NSString::from_str("—")];
         let _: () = msg_send![&item_focus, setTarget: &*delegate];
         let _: () = msg_send![&item_focus, setAction: objc2::sel!(openDetailFocus:)];
         let _: () = msg_send![&menu, addItem: &*item_focus];
 
-        let item_tools: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_tools: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_tools, setTitle: &*NSString::from_str("—")];
         let _: () = msg_send![&item_tools, setTarget: &*delegate];
         let _: () = msg_send![&item_tools, setAction: objc2::sel!(openDetailTools:)];
@@ -386,7 +386,7 @@ pub fn run_menubar() {
         let _: () = msg_send![&menu, addItem: &*sep3];
 
         // Streak
-        let item_streak: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_streak: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_streak, setTitle: &*NSString::from_str("—")];
         let _: () = msg_send![&item_streak, setEnabled: false];
         let _: () = msg_send![&menu, addItem: &*item_streak];
@@ -396,7 +396,7 @@ pub fn run_menubar() {
         let _: () = msg_send![&menu, addItem: &*sep4];
 
         // Open dashboard
-        let item_open: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_open: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_open, setTitle: &*NSString::from_str("Open Dashboard ↗")];
         let _: () = msg_send![&item_open, setTarget: &*delegate];
         let _: () = msg_send![&item_open, setAction: objc2::sel!(openDashboard:)];
@@ -407,7 +407,7 @@ pub fn run_menubar() {
         let _: () = msg_send![&menu, addItem: &*sep5];
 
         // Quit
-        let item_quit: Retained<AnyObject> = msg_send_id![objc2::class!(NSMenuItem), new];
+        let item_quit: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_quit, setTitle: &*NSString::from_str("Quit")];
         let _: () = msg_send![&item_quit, setTarget: &*delegate];
         let _: () = msg_send![&item_quit, setAction: objc2::sel!(quitApp:)];

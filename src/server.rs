@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::config::{load_config, save_config};
 use crate::data_collector::{
-    agent_meta, calc_streak, collect_day_full, collect_history, providers,
+    agent_meta, calc_streak, clear_caches, collect_day_full, collect_history, providers,
     update_streak_cache,
 };
 
@@ -229,6 +229,9 @@ async fn api_set_agents(
     let mut goals = load_config();
     goals.enabled_agents = enabled;
     save_config(&goals);
+
+    // Invalidate caches so next API call reflects the new agent selection
+    clear_caches();
 
     let state = state.read().await;
     for cb in &state.goals_changed_callbacks {

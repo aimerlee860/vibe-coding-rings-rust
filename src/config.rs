@@ -37,7 +37,11 @@ pub fn gemini_dir() -> PathBuf {
 }
 
 pub fn opencode_dir() -> PathBuf {
-    home_dir().join(".opencode")
+    home_dir().join(".local/share/opencode")
+}
+
+pub fn opencode_db() -> PathBuf {
+    opencode_dir().join("opencode.db")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

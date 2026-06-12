@@ -614,65 +614,95 @@ pub struct OpenCodeProvider;
 
 impl AgentProvider for OpenCodeProvider {
     fn is_available(&self) -> bool {
-        config::opencode_dir().exists()
+        config::opencode_db().exists()
     }
 
     fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
         let mut data = DayData::default();
 
-        for file in iter_session_files(&config::opencode_dir(), start_ms, end_ms) {
-            process_jsonl(&file, |entry| {
-                let ts_raw = match entry.get("timestamp") {
-                    Some(Value::String(s)) => s.as_str(),
-                    _ => return,
-                };
-                let ts_ms = match iso_to_ms(ts_raw) {
-                    Some(ms) => ms,
-                    None => return,
-                };
-                if !(start_ms..end_ms).contains(&ts_ms) {
-                    return;
-                }
-                if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                    return;
-                }
-                let msg = match entry.get("message") {
-                    Some(Value::Object(m)) => m,
-                    _ => return,
-                };
-                let usage = match msg.get("usage") {
-                    Some(Value::Object(u)) => u,
-                    _ => return,
-                };
+        let db_path = config::opencode_db();
+        let conn = match rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(c) => c,
+            Err(_) => return data,
+        };
 
-                let hour = ms_to_local_hour(ts_ms) as usize;
-                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let total_tokens = input_tokens + cache_read + cache_creation;
+        // ── Tokens from message table (per-message, with hourly breakdown) ──
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(data, '$.tokens.input'), \
+                    json_extract(data, '$.tokens.cache.read'), \
+                    json_extract(data, '$.tokens.cache.write'), \
+                    json_extract(data, '$.time.created') \
+             FROM message \
+             WHERE json_extract(data, '$.role') = 'assistant' \
+               AND json_extract(data, '$.time.created') >= ? \
+               AND json_extract(data, '$.time.created') < ?",
+        ) {
+            Ok(s) => s,
+            Err(_) => return data,
+        };
 
-                data.tokens += total_tokens;
-                data.hourly.tokens[hour] += total_tokens;
+        let rows = stmt.query_map(rusqlite::params![start_ms, end_ms], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64,  // input
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,  // cache_read
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,  // cache_write
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),                 // timestamp
+            ))
+        });
 
-                if let Some(Value::Array(content)) = msg.get("content") {
-                    for block in content {
-                        if let Value::Object(b) = block {
-                            if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                data.tools += 1;
-                                data.hourly.tools[hour] += 1;
-                            }
-                        }
-                    }
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (input, cache_read, cache_write, ts) = row;
+                let total = input + cache_read + cache_write;
+                if total == 0 {
+                    continue;
                 }
-            });
+                let hour = ms_to_local_hour(ts) as usize;
+                data.tokens += total;
+                data.hourly.tokens[hour] += total;
+            }
         }
 
-        // Calculate focus from history (single read)
-        let history_file = config::opencode_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
-        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+        // ── Tool calls from part table ──
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT time_created FROM part \
+             WHERE json_extract(data, '$.type') = 'tool' \
+               AND time_created >= ? AND time_created < ?",
+        ) {
+            let rows = stmt.query_map(rusqlite::params![start_ms, end_ms], |row| {
+                row.get::<_, i64>(0)
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let hour = ms_to_local_hour(row) as usize;
+                    data.tools += 1;
+                    data.hourly.tools[hour] += 1;
+                }
+            }
+        }
+
+        // ── Focus from message timestamps grouped by session ──
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT session_id, time_created FROM message \
+             WHERE json_extract(data, '$.role') = 'assistant' \
+               AND time_created >= ? AND time_created < ?",
+        ) {
+            let mut sessions: Sessions = HashMap::new();
+            let rows = stmt.query_map(rusqlite::params![start_ms, end_ms], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    sessions.entry(row.0).or_default().push(row.1);
+                }
+            }
+            data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
+            data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+        }
 
         data
     }

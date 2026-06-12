@@ -7,15 +7,16 @@ use crate::providers::{
     HourlyData,
 };
 
-// ── 5-second data cache ───────────────────────────────────────────────────────
+// ── 10-second data cache ───────────────────────────────────────────────────────
 
-const CACHE_TTL_SECS: u64 = 5;
+const CACHE_TTL_SECS: u64 = 10;
 
 struct DayCache {
     refreshed_at: Instant,
     date: NaiveDate,
     metrics: DayMetrics,
     hourly: HourlyData,
+    per_provider: Vec<ProviderDayData>,
 }
 
 struct HistoryCache {
@@ -40,13 +41,6 @@ pub fn providers() -> Vec<(&'static str, Box<dyn AgentProvider>)> {
     ]
 }
 
-fn active_providers(goals: &Goals) -> Vec<Box<dyn AgentProvider>> {
-    providers()
-        .into_iter()
-        .filter(|(key, p)| goals.enabled_agents.contains(&key.to_string()) && p.is_available())
-        .map(|(_, p)| p)
-        .collect()
-}
 
 // ── Day metrics ───────────────────────────────────────────────────────────────
 
@@ -99,15 +93,25 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
         }
     }
 
-    let provs = active_providers(goals);
+    let meta: std::collections::HashMap<&str, &str> = agent_meta()
+        .iter()
+        .map(|m| (m.id, m.label))
+        .collect();
+
+    let provs = providers();
     let mut total_tokens: u64 = 0;
     let mut total_tools: u64 = 0;
     let mut total_focus: f64 = 0.0;
     let mut hourly_tokens = vec![0u64; 24];
     let mut hourly_tools = vec![0u64; 24];
     let mut hourly_focus = vec![0.0f64; 24];
+    let mut per_provider: Vec<ProviderDayData> = Vec::new();
 
-    for p in &provs {
+    for (key, p) in &provs {
+        // Skip disabled or unavailable providers
+        if !goals.enabled_agents.contains(&key.to_string()) || !p.is_available() {
+            continue;
+        }
         let data = p.collect_all(target);
         total_tokens += data.tokens;
         total_tools += data.tools;
@@ -116,6 +120,18 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
             hourly_tokens[h] += data.hourly.tokens[h];
             hourly_tools[h] += data.hourly.tools[h];
             hourly_focus[h] += data.hourly.focus[h];
+        }
+
+        // Collect per-provider data (only providers with activity)
+        if data.tokens > 0 || data.tools > 0 {
+            let label = meta.get(key).map(|s| s.to_string()).unwrap_or_else(|| key.to_string());
+            per_provider.push(ProviderDayData {
+                id: key.to_string(),
+                label,
+                tokens: data.tokens,
+                tools: data.tools,
+                focus_min: data.focus_min,
+            });
         }
     }
 
@@ -142,6 +158,7 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
         date: target,
         metrics: metrics.clone(),
         hourly: hourly.clone(),
+        per_provider,
     });
 
     (metrics, hourly)
@@ -155,6 +172,16 @@ pub fn collect_day_metrics(target: NaiveDate, goals: &Goals) -> DayMetrics {
 /// Collect both metrics and hourly data in one pass - avoids duplicate scanning
 pub fn collect_day_full(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData) {
     collect_day_data(target, goals)
+}
+
+/// Clear all caches (call after config changes like agent toggle)
+pub fn clear_caches() {
+    if let Some(cache) = DAY_CACHE.get() {
+        *cache.lock().unwrap() = None;
+    }
+    if let Some(cache) = HISTORY_CACHE.get() {
+        *cache.lock().unwrap() = None;
+    }
 }
 
 pub fn collect_history(goals: &Goals, days: usize) -> Vec<DayMetrics> {
@@ -292,6 +319,33 @@ pub fn agent_meta() -> Vec<AgentMeta> {
         AgentMeta { id: "claude_code", label: "Claude Code", dir: "~/.claude" },
         AgentMeta { id: "codex", label: "Codex", dir: "~/.codex" },
         AgentMeta { id: "gemini", label: "Gemini CLI", dir: "~/.gemini" },
-        AgentMeta { id: "opencode", label: "OpenCode", dir: "~/.opencode" },
+        AgentMeta { id: "opencode", label: "OpenCode", dir: "~/.local/share/opencode" },
     ]
+}
+
+// ── Per-provider data ─────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct ProviderDayData {
+    #[allow(dead_code)]
+    pub id: String,
+    pub label: String,
+    pub tokens: u64,
+    pub tools: u64,
+    pub focus_min: f64,
+}
+
+pub fn collect_per_provider(target: NaiveDate, goals: &Goals) -> Vec<ProviderDayData> {
+    // Ensure cache is populated (collect_day_data fills per_provider)
+    collect_day_data(target, goals);
+    // Read from cache
+    if let Some(cache) = DAY_CACHE.get() {
+        let guard = cache.lock().unwrap();
+        if let Some(ref c) = *guard {
+            if c.date == target {
+                return c.per_provider.clone();
+            }
+        }
+    }
+    Vec::new()
 }

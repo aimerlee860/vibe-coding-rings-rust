@@ -8,7 +8,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 use crate::config::load_config;
-use crate::data_collector::{calc_streak_fast, collect_day_metrics};
+use crate::data_collector::{calc_streak_fast, collect_day_metrics, collect_per_provider};
 use crate::server::PORT;
 
 // ── Ring definitions (radius, r, g, b) — matches style.css ───────────────────
@@ -159,6 +159,7 @@ struct MenuBarUI {
     item_tools: Retained<AnyObject>,
     item_streak: Retained<AnyObject>,
     item_open: Retained<AnyObject>,
+    item_providers: Vec<Retained<AnyObject>>,
 }
 
 thread_local! {
@@ -274,6 +275,22 @@ fn refresh_stats() {
             let _: () = msg_send![&*ui.item_tools, setTitle: &*NSString::from_str(&tools_title)];
             let _: () = msg_send![&*ui.item_streak, setTitle: &*NSString::from_str(&streak_title)];
             let _: () = msg_send![&*ui.item_open, setTitle: &*NSString::from_str(&open_title)];
+
+            // Update provider breakdown items
+            let per_provider = collect_per_provider(today, &goals);
+            let min_label = if zh { "分钟" } else { "min" };
+            for (i, item) in ui.item_providers.iter().enumerate() {
+                if i < per_provider.len() {
+                    let p = &per_provider[i];
+                    let tok = fmt_tokens(p.tokens);
+                    let foc = format!("{}", p.focus_min.round() as u64);
+                    let title = format!("{}  {} · {}{} · {}", p.label, tok, foc, min_label, p.tools);
+                    let _: () = msg_send![&**item, setTitle: &*NSString::from_str(&title)];
+                    let _: () = msg_send![&**item, setHidden: false];
+                } else {
+                    let _: () = msg_send![&**item, setHidden: true];
+                }
+            }
         }
     });
 }
@@ -385,6 +402,21 @@ pub fn run_menubar() {
         let sep3: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
         let _: () = msg_send![&menu, addItem: &*sep3];
 
+        // Provider breakdown items (match provider count, hidden by default)
+        let mut item_providers: Vec<Retained<AnyObject>> = Vec::new();
+        for _ in 0..crate::data_collector::providers().len() {
+            let item: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
+            let _: () = msg_send![&item, setTitle: &*NSString::from_str("")];
+            let _: () = msg_send![&item, setEnabled: false];
+            let _: () = msg_send![&item, setHidden: true];
+            let _: () = msg_send![&menu, addItem: &*item];
+            item_providers.push(item);
+        }
+
+        // Separator
+        let sep_prov: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![&menu, addItem: &*sep_prov];
+
         // Streak
         let item_streak: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), new];
         let _: () = msg_send![&item_streak, setTitle: &*NSString::from_str("—")];
@@ -428,6 +460,7 @@ pub fn run_menubar() {
             item_tools,
             item_streak,
             item_open,
+            item_providers,
         });
 
         MENU_UI.with(|cell| {

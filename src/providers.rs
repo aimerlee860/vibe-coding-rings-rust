@@ -71,7 +71,7 @@ fn sessions_to_focus_blocks(sessions: &Sessions) -> Vec<(i64, i64)> {
     blocks
 }
 
-fn merge_intervals(intervals: &mut [(i64, i64)]) -> Vec<(i64, i64)> {
+pub fn merge_intervals(intervals: &mut [(i64, i64)]) -> Vec<(i64, i64)> {
     if intervals.is_empty() {
         return Vec::new();
     }
@@ -88,7 +88,7 @@ fn merge_intervals(intervals: &mut [(i64, i64)]) -> Vec<(i64, i64)> {
     result
 }
 
-fn interval_ms_in_range(merged: &[(i64, i64)], lo: i64, hi: i64) -> i64 {
+pub fn interval_ms_in_range(merged: &[(i64, i64)], lo: i64, hi: i64) -> i64 {
     let mut total: i64 = 0;
     for &(s, e) in merged {
         let cs = s.max(lo);
@@ -100,28 +100,10 @@ fn interval_ms_in_range(merged: &[(i64, i64)], lo: i64, hi: i64) -> i64 {
     total
 }
 
-pub fn focus_from_sessions(sessions: &Sessions, start_ms: i64, end_ms: i64) -> f64 {
-    if sessions.is_empty() {
-        return 0.0;
-    }
+/// Build deduped focus intervals (merged across sessions) from per-session timestamps.
+pub fn sessions_to_merged_blocks(sessions: &Sessions) -> Vec<(i64, i64)> {
     let mut blocks = sessions_to_focus_blocks(sessions);
-    let merged = merge_intervals(&mut blocks);
-    interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0
-}
-
-pub fn focus_hourly_from_sessions(sessions: &Sessions, start_ms: i64, _end_ms: i64) -> Vec<f64> {
-    if sessions.is_empty() {
-        return vec![0.0; 24];
-    }
-    let mut blocks = sessions_to_focus_blocks(sessions);
-    let merged = merge_intervals(&mut blocks);
-    let hour_ms = 3_600_000;
-    (0..24)
-        .map(|h| {
-            interval_ms_in_range(&merged, start_ms + h as i64 * hour_ms, start_ms + (h + 1) as i64 * hour_ms) as f64
-                / 60_000.0
-        })
-        .collect()
+    merge_intervals(&mut blocks)
 }
 
 // ── JSONL reading helpers (streaming) ───────────────────────────────────────────
@@ -248,8 +230,9 @@ pub trait AgentProvider: Send + Sync {
 pub struct DayData {
     pub tokens: u64,
     pub tools: u64,
-    pub focus_min: f64,  // Total focus minutes for the day
-    pub hourly: HourlyData,
+    pub focus_min: f64,                // This provider's focus minutes (per-provider display)
+    pub focus_blocks: Vec<(i64, i64)>, // Merged focus intervals (cross-provider dedup at aggregate layer)
+    pub hourly: HourlyData,            // focus[] filled by aggregate layer from merged blocks
 }
 
 #[derive(Clone)]
@@ -275,6 +258,7 @@ impl Default for DayData {
             tokens: 0,
             tools: 0,
             focus_min: 0.0,
+            focus_blocks: Vec::new(),
             hourly: HourlyData::default(),
         }
     }
@@ -293,10 +277,17 @@ impl AgentProvider for ClaudeCodeProvider {
     fn collect_all(&self, target: chrono::NaiveDate) -> DayData {
         let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
         let mut data = DayData::default();
+        let mut sessions: Sessions = HashMap::new();
         let projects_dir = config::claude_dir().join("projects");
 
         if projects_dir.exists() {
             for file in iter_session_files(&projects_dir, start_ms, end_ms) {
+                // One session per file; use filename (uuid) as the session key.
+                let session_key = file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("__nosid__")
+                    .to_string();
                 process_jsonl(&file, |entry| {
                     let ts_raw = match entry.get("timestamp") {
                         Some(Value::String(s)) => s.as_str(),
@@ -312,6 +303,11 @@ impl AgentProvider for ClaudeCodeProvider {
                     if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
                         return;
                     }
+
+                    // Focus only needs the timestamp of assistant activity — collect it
+                    // before the usage guard so messages without usage still count as focus time.
+                    sessions.entry(session_key.clone()).or_default().push(ts_ms);
+
                     let msg = match entry.get("message") {
                         Some(Value::Object(m)) => m,
                         _ => return,
@@ -325,7 +321,8 @@ impl AgentProvider for ClaudeCodeProvider {
                     let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let total_tokens = input_tokens + cache_read + cache_creation;
+                    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let total_tokens = input_tokens + cache_read + cache_creation + output_tokens;
 
                     data.tokens += total_tokens;
                     data.hourly.tokens[hour] += total_tokens;
@@ -344,11 +341,11 @@ impl AgentProvider for ClaudeCodeProvider {
             }
         }
 
-        // Calculate focus from history (single read, shared with hourly)
-        let history_file = config::claude_dir().join("history.jsonl");
-        let sessions = read_history_sessions(&history_file, start_ms, end_ms, true);
-        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
-        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+        // Focus from assistant message timestamps — same source as tokens/tools,
+        // so the focus window covers actual agent work time, not just user prompts.
+        let merged = sessions_to_merged_blocks(&sessions);
+        data.focus_blocks = merged.clone();
+        data.focus_min = interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0;
 
         data
     }
@@ -470,11 +467,12 @@ impl AgentProvider for CodexProvider {
             });
         }
 
-        // Calculate focus from history (single read)
+        // Focus from history timestamps
         let history_file = config::codex_dir().join("history.jsonl");
         let sessions = read_history_sessions(&history_file, start_ms, end_ms, false);
-        data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
-        data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+        let merged = sessions_to_merged_blocks(&sessions);
+        data.focus_blocks = merged.clone();
+        data.focus_min = interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0;
 
         data
     }
@@ -593,13 +591,14 @@ impl AgentProvider for GeminiProvider {
             });
         }
 
-        // Calculate focus from history (single read)
+        // Focus from history timestamps
         for name in &["history.jsonl", "history"] {
             let history = config::gemini_dir().join(name);
             if history.exists() {
                 let sessions = read_history_sessions(&history, start_ms, end_ms, false);
-                data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
-                data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+                let merged = sessions_to_merged_blocks(&sessions);
+                data.focus_blocks = merged.clone();
+                data.focus_min = interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0;
                 break;
             }
         }
@@ -635,6 +634,7 @@ impl AgentProvider for OpenCodeProvider {
             "SELECT json_extract(data, '$.tokens.input'), \
                     json_extract(data, '$.tokens.cache.read'), \
                     json_extract(data, '$.tokens.cache.write'), \
+                    json_extract(data, '$.tokens.output'), \
                     json_extract(data, '$.time.created') \
              FROM message \
              WHERE json_extract(data, '$.role') = 'assistant' \
@@ -650,14 +650,15 @@ impl AgentProvider for OpenCodeProvider {
                 row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64,  // input
                 row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,  // cache_read
                 row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,  // cache_write
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),                 // timestamp
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,  // output
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),                 // timestamp
             ))
         });
 
         if let Ok(rows) = rows {
             for row in rows.flatten() {
-                let (input, cache_read, cache_write, ts) = row;
-                let total = input + cache_read + cache_write;
+                let (input, cache_read, cache_write, output, ts) = row;
+                let total = input + cache_read + cache_write + output;
                 if total == 0 {
                     continue;
                 }
@@ -700,8 +701,9 @@ impl AgentProvider for OpenCodeProvider {
                     sessions.entry(row.0).or_default().push(row.1);
                 }
             }
-            data.focus_min = focus_from_sessions(&sessions, start_ms, end_ms);
-            data.hourly.focus = focus_hourly_from_sessions(&sessions, start_ms, end_ms);
+            let merged = sessions_to_merged_blocks(&sessions);
+            data.focus_blocks = merged.clone();
+            data.focus_min = interval_ms_in_range(&merged, start_ms, end_ms) as f64 / 60_000.0;
         }
 
         data

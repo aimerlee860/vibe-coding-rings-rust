@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::config::{Goals, StreakCache};
 use crate::providers::{
     ClaudeCodeProvider, CodexProvider, GeminiProvider, OpenCodeProvider, AgentProvider,
-    HourlyData,
+    HourlyData, local_date_to_utc_ms_range, merge_intervals, interval_ms_in_range,
 };
 
 // ── 10-second data cache ───────────────────────────────────────────────────────
@@ -101,10 +101,9 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
     let provs = providers();
     let mut total_tokens: u64 = 0;
     let mut total_tools: u64 = 0;
-    let mut total_focus: f64 = 0.0;
+    let mut all_focus_blocks: Vec<(i64, i64)> = Vec::new();
     let mut hourly_tokens = vec![0u64; 24];
     let mut hourly_tools = vec![0u64; 24];
-    let mut hourly_focus = vec![0.0f64; 24];
     let mut per_provider: Vec<ProviderDayData> = Vec::new();
 
     for (key, p) in &provs {
@@ -115,11 +114,10 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
         let data = p.collect_all(target);
         total_tokens += data.tokens;
         total_tools += data.tools;
-        total_focus += data.focus_min;
+        all_focus_blocks.extend(data.focus_blocks);
         for h in 0..24 {
             hourly_tokens[h] += data.hourly.tokens[h];
             hourly_tools[h] += data.hourly.tools[h];
-            hourly_focus[h] += data.hourly.focus[h];
         }
 
         // Collect per-provider data (only providers with activity)
@@ -134,6 +132,19 @@ fn collect_day_data(target: NaiveDate, goals: &Goals) -> (DayMetrics, HourlyData
             });
         }
     }
+
+    // Cross-provider dedup: merge every provider's focus intervals, then measure
+    // total minutes and per-hour minutes against the day window.
+    let (start_ms, end_ms) = local_date_to_utc_ms_range(target);
+    let merged_focus = merge_intervals(&mut all_focus_blocks);
+    let total_focus = interval_ms_in_range(&merged_focus, start_ms, end_ms) as f64 / 60_000.0;
+    let hour_ms = 3_600_000;
+    let hourly_focus: Vec<f64> = (0..24)
+        .map(|h| {
+            interval_ms_in_range(&merged_focus, start_ms + h as i64 * hour_ms, start_ms + (h + 1) as i64 * hour_ms) as f64
+                / 60_000.0
+        })
+        .collect();
 
     let metrics = DayMetrics {
         date: target.to_string(),
